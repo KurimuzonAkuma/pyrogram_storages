@@ -194,16 +194,9 @@ class EncryptedFernetStorage(Storage):
         os.remove(self.database)
 
     async def update_peers(self, peers: List[Tuple[int, int, str, str]]):
-        peers_data = []
-
-        for id, access_hash, type, phone_number in peers:
-            encrypted_access_hash = self.fernet.encrypt(access_hash.to_bytes(8, byteorder='big'))
-            encrypted_phone_number = self.fernet.encrypt(phone_number.encode())
-            peers_data.append((id, encrypted_access_hash, type, encrypted_phone_number))
-
         self.conn.executemany(
             "REPLACE INTO peers (id, access_hash, type, phone_number) VALUES (?, ?, ?, ?)",
-            peers_data
+            peers
         )
 
     async def update_usernames(self, usernames: List[Tuple[int, List[str]]]):
@@ -246,11 +239,7 @@ class EncryptedFernetStorage(Storage):
         if r is None:
             raise KeyError(f"ID not found: {peer_id}")
 
-        return get_input_peer(
-            peer_id=r[0],
-            access_hash=int(self.fernet.decrypt(r[1]).decode()),
-            peer_type=r[2]
-        )
+        return get_input_peer(*r)
 
     async def get_peer_by_username(self, username: str):
         r = self.conn.execute(
@@ -267,26 +256,18 @@ class EncryptedFernetStorage(Storage):
         if abs(time.time() - r[3]) > self.USERNAME_TTL:
             raise KeyError(f"Username expired: {username}")
 
-        return get_input_peer(
-            peer_id=r[0],
-            access_hash=int(self.fernet.decrypt(r[1]).decode()),
-            peer_type=r[2]
-        )
+        return get_input_peer(*r[:3])
 
     async def get_peer_by_phone_number(self, phone_number: str):
         r = self.conn.execute(
             "SELECT id, access_hash, type FROM peers WHERE phone_number = ?",
-            (self.fernet.encrypt(phone_number.encode()),)
+            (phone_number,)
         ).fetchone()
 
         if r is None:
             raise KeyError(f"Phone number not found: {phone_number}")
 
-        return get_input_peer(
-            peer_id=r[0],
-            access_hash=int(self.fernet.decrypt(r[1]).decode()),
-            peer_type=r[2]
-        )
+        return get_input_peer(*r)
 
     def _get(self):
         attr = inspect.stack()[2].function
@@ -317,14 +298,16 @@ class EncryptedFernetStorage(Storage):
 
     async def auth_key(self, value: bytes = object):
         if value == object:
-            return self.fernet.decrypt(self.conn.execute(
+            r = self.conn.execute(
                 "SELECT auth_key FROM sessions"
-            ).fetchone()[0]).decode()
+            ).fetchone()[0]
+
+            return self.fernet.decrypt(r) if r else None
         else:
             with self.conn:
                 self.conn.execute(
                     "UPDATE sessions SET auth_key = ?",
-                    (self.fernet.encrypt(value.encode()),)
+                    (self.fernet.encrypt(value),)
                 )
 
     async def date(self, value: int = object):

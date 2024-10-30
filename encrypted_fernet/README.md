@@ -1,5 +1,7 @@
 # Encrypted Fernet
 
+Thanks to PureAholy
+
 ## Example
 
 ```python
