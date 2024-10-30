@@ -3,7 +3,6 @@ import sqlite3
 import logging
 import os
 import time
-from pathlib import Path
 from typing import Any, List, Tuple
 
 from pyrogram import Client, raw, utils
@@ -202,13 +201,28 @@ class TelethonStorage(Storage):
 
     async def update_usernames(self, usernames: List[Tuple[int, List[str]]]):
         self.conn.executemany(
-            "REPLACE INTO entities (id, username) VALUES (?, ?)",
-            [(id, username) for id, usernames in usernames for username in usernames]
+            "UPDATE entities SET username = ? WHERE id = ?",
+            [(usernames[0], id) for id, usernames in usernames if usernames]
         )
 
     async def update_state(self, value: Tuple[int, int, int, int, int] = object):
-        # TODO
-        return None
+        if value == object:
+            return self.conn.execute(
+                "SELECT id, pts, qts, date, seq FROM update_state "
+                "ORDER BY date ASC"
+            ).fetchall()
+        else:
+            if isinstance(value, int):
+                self.conn.execute(
+                    "DELETE FROM update_state WHERE id = ?",
+                    (value,)
+                )
+            else:
+                self.conn.execute(
+                    "REPLACE INTO update_state (id, pts, qts, date, seq)"
+                    "VALUES (?, ?, ?, ?, ?)",
+                    value
+                )
 
     async def get_peer_by_id(self, peer_id: int):
         r = self.conn.execute(
