@@ -1,4 +1,3 @@
-import asyncio
 import inspect
 import aiosqlite
 import time
@@ -166,7 +165,7 @@ class AIOSQLiteStorage(Storage):
 
             version += 1
 
-        self.version(version)
+        await self.version(version)
 
     async def open(self):
         path = self.database
