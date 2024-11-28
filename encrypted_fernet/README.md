@@ -9,7 +9,6 @@ from storage import EncryptedFernetStorage
 
 async def main():
     workdir = Path(__file__).parent
-    test_mode = True
 
     app = Client(
         session_name,
