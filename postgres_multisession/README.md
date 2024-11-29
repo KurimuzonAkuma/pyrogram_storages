@@ -10,20 +10,20 @@ from storage import MultiPostgresStorage
 async def main():
     workdir = Path(__file__).parent
 
-    pool = await asyncpg.create_pool(
-        user='postgres',
-        password='password',
-        database='pyrogram',
-        host='localhost',
-        port=5432,
-    )
+    database = {
+        'db_user': 'postgres',
+        'db_pass': 'password',
+        'db_host': 'localhost',
+        'db_port': 5432,
+        'db_name': 'pyrogram'
+    }
 
     app = Client(
         session_name,
         api_id=api_id,
         api_hash=api_hash
     )
-    app.storage = MultiPostgresStorage(client=app, pool=pool)
+    app.storage = MultiPostgresStorage(client=app, database=database)
 
     await app.start()
 
