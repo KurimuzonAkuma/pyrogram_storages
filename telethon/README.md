@@ -6,8 +6,6 @@
 from storage import TelethonStorage
 
 async def main():
-    workdir = Path(__file__).parent
-
     app = Client(
         session_name,
         api_id=api_id,
@@ -33,8 +31,6 @@ loop.run_until_complete(main())
 from storage import TelethonStorage
 
 async def main():
-    workdir = Path(__file__).parent
-
     app = Client(
         session_name,
         api_id=api_id,
@@ -48,8 +44,7 @@ async def main():
 
         app.storage = storage
     except sqlite3.OperationalError as e:
-        if "no such column: version" not in str(e):
-            raise
+        pass
 
     await app.start()
 
