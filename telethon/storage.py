@@ -1,4 +1,3 @@
-import inspect
 import sqlite3
 import logging
 import os
@@ -79,9 +78,9 @@ def get_input_peer(peer_id: int, access_hash: int):
 
 
 class TelethonStorage(Storage):
-    FILE_EXTENSION = ".session"
     VERSION = 7
     USERNAME_TTL = 8 * 60 * 60
+    FILE_EXTENSION = ".session"
 
     def __init__(self, *, client: Client):
         super().__init__(client.name)
@@ -92,7 +91,7 @@ class TelethonStorage(Storage):
 
         self.database = client.workdir / (client.name + self.FILE_EXTENSION)
 
-    def create(self):
+    async def create(self):
         with self.conn:
             self.conn.executescript(SCHEMA)
 
@@ -106,8 +105,8 @@ class TelethonStorage(Storage):
                 (2, "149.154.167.51", 443, None, 0)
             )
 
-    def update(self):
-        version = self.version()
+    async def update(self):
+        version = await self.version()
 
         if version == 1:
             version += 1
@@ -160,7 +159,7 @@ class TelethonStorage(Storage):
             with self.conn:
                 self.conn.execute("ALTER TABLE entities ADD COLUMN date integer")
 
-        self.version(version)
+        await self.version(version)
 
     async def open(self):
         path = self.database
@@ -169,9 +168,9 @@ class TelethonStorage(Storage):
         self.conn = sqlite3.connect(str(path), timeout=1, check_same_thread=False)
 
         if not file_exists:
-            self.create()
+            await self.create()
         else:
-            self.update()
+            await self.update()
 
         with self.conn:
             self.conn.execute("VACUUM")
@@ -206,7 +205,7 @@ class TelethonStorage(Storage):
         )
 
     async def update_state(self, value: Tuple[int, int, int, int, int] = object):
-        if value == object:
+        if value is object:
             return self.conn.execute(
                 "SELECT id, pts, qts, date, seq FROM update_state "
                 "ORDER BY date ASC"
@@ -261,52 +260,49 @@ class TelethonStorage(Storage):
 
         return get_input_peer(*r)
 
-    def _get(self):
-        attr = inspect.stack()[2].function
+    async def _get(self, table: str, attr: str):
+        return self.conn.execute(f"SELECT {attr} FROM {table}").fetchone()[0]
 
-        return self.conn.execute(
-            f"SELECT {attr} FROM sessions"
-        ).fetchone()[0]
-
-    def _set(self, value: Any):
-        attr = inspect.stack()[2].function
-
+    async def _set(self, table: str, attr: str, value: Any):
         with self.conn:
-            self.conn.execute(
-                f"UPDATE sessions SET {attr} = ?",
-                (value,)
-            )
+            self.conn.execute(f"UPDATE {table} SET {attr} = ?", (value,))
 
-    def _accessor(self, value: Any = object):
-        return self._get() if value == object else self._set(value)
+    async def _accessor(self, table: str, attr: str, value: Any = object):
+        return await self._get(table, attr) if value is object else await self._set(table, attr, value)
 
     async def dc_id(self, value: int = object):
-        return self._accessor(value)
+        return await self._accessor("sessions", "dc_id", value)
+
+    async def server_address(self, value: str = object):
+        return await self._accessor("sessions", "server_address", value)
+
+    async def port(self, value: int = object):
+        return await self._accessor("sessions", "port", value)
 
     async def api_id(self, value: int = object):
-        if value != object:
+        if value is not object:
             self._api_id = value
 
         return self._api_id
 
     async def test_mode(self, value: bool = object):
-        if value != object:
+        if value is not object:
             self._test_mode = value
 
         return self._test_mode
 
     async def auth_key(self, value: bytes = object):
-        return self._accessor(value)
+        return await self._accessor("sessions", "auth_key", value)
 
     async def date(self, value: int = object):
-        if value == object:
+        if value is object:
             cur = self.conn.execute(
                 "SELECT date FROM entities WHERE id=0"
             )
 
             res = cur.fetchone()
 
-            return None if res is None else res[0]
+            return res[0] if res else None
         else:
             with self.conn:
                 self.conn.execute(
@@ -315,14 +311,14 @@ class TelethonStorage(Storage):
                 )
 
     async def user_id(self, value: int = object):
-        if value == object:
+        if value is object:
             cur = self.conn.execute(
                 "SELECT hash FROM entities WHERE id=0"
             )
 
             res = cur.fetchone()
 
-            return 0 if res is None else res[0]
+            return res[0] if res else None
         else:
             if value is None:
                 return
@@ -334,19 +330,10 @@ class TelethonStorage(Storage):
                 )
 
     async def is_bot(self, value: bool = object):
-        if value != object:
+        if value is not object:
             self._is_bot = value
 
         return self._is_bot
 
-    def version(self, value: int = object):
-        if value == object:
-            return self.conn.execute(
-                "SELECT version FROM version"
-            ).fetchone()[0]
-        else:
-            with self.conn:
-                self.conn.execute(
-                    "UPDATE version SET version = ?",
-                    (value,)
-                )
+    async def version(self, value: int = object):
+        return await self._accessor("version", "version", value)
