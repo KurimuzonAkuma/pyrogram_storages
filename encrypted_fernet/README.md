@@ -2,6 +2,11 @@
 
 Thanks to PureAholy
 
+> [!WARNING]
+> This storage encrypts ***only*** the auth key.
+> 
+> So if someone has your session file, they will not be able to access your account without the key.
+
 ## Example
 
 ```python
