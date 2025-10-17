@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
+from cryptography.fernet import Fernet
 from pyrogram import Client, raw, utils
 from pyrogram.storage import Storage
 
@@ -131,7 +132,7 @@ def get_input_peer(peer_id: int, access_hash: int, peer_type: str):
     raise ValueError(f"Invalid peer type: {peer_type}")
 
 
-class AIOSQLiteStorage(Storage):
+class EncryptedFernetStorage(Storage):
     VERSION = 7
     USERNAME_TTL = 8 * 60 * 60
     FILE_EXTENSION = ".session"
@@ -139,11 +140,13 @@ class AIOSQLiteStorage(Storage):
     def __init__(
         self,
         client: Client,
+        key: bytes,
         use_wal: Optional[bool] = False,
     ):
         super().__init__(client.name)
 
         self.conn = None  # type: aiosqlite.Connection
+        self.fernet = Fernet(key)
 
         self.session_string = client.session_string
         self.in_memory = client.in_memory
