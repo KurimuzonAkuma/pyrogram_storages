@@ -5,12 +5,23 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Tuple, Union
 
+from Crypto.Cipher import AES
+from Crypto.Hash import SHA512
+from Crypto.Protocol.KDF import PBKDF2
+from Crypto.Random import get_random_bytes
 from pyrogram import Client, raw, utils
 from pyrogram.storage import Storage, UpdateState
 
 import aiosqlite
 
 log = logging.getLogger(__name__)
+
+PBKDF2_ITERATIONS = 1_000_000
+
+SALT_SIZE = 16
+NONCE_SIZE = 12
+TAG_SIZE = 16
+KEY_SIZE = 32
 
 
 # language=SQLite
@@ -122,7 +133,62 @@ def get_input_peer(peer_id: int, access_hash: int, peer_type: str):
     raise ValueError(f"Invalid peer type: {peer_type}")
 
 
-class AIOSQLiteStorage(Storage):
+def _derive_key(password: str, salt: bytes) -> bytes:
+    return PBKDF2(
+        password.encode("utf-8"),
+        salt,
+        dkLen=KEY_SIZE,
+        count=PBKDF2_ITERATIONS,
+        hmac_hash_module=SHA512,
+    )
+
+
+def encrypt(data: bytes, password: str) -> bytes:
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+
+    salt = get_random_bytes(SALT_SIZE)
+    nonce = get_random_bytes(NONCE_SIZE)
+
+    key = _derive_key(password, salt)
+
+    cipher = AES.new(
+        key,
+        AES.MODE_GCM,
+        nonce=nonce,
+    )
+
+    ciphertext, tag = cipher.encrypt_and_digest(data)
+
+    return salt + nonce + tag + ciphertext
+
+
+def decrypt(data: bytes, password: str) -> bytes:
+    minimum_size = SALT_SIZE + NONCE_SIZE + TAG_SIZE
+
+    if len(data) < minimum_size:
+        raise ValueError("Invalid encrypted auth_key")
+
+    salt = data[:SALT_SIZE]
+    nonce = data[SALT_SIZE : SALT_SIZE + NONCE_SIZE]
+    tag = data[SALT_SIZE + NONCE_SIZE : SALT_SIZE + NONCE_SIZE + TAG_SIZE]
+    ciphertext = data[SALT_SIZE + NONCE_SIZE + TAG_SIZE :]
+
+    key = _derive_key(password, salt)
+
+    cipher = AES.new(
+        key,
+        AES.MODE_GCM,
+        nonce=nonce,
+    )
+
+    try:
+        return cipher.decrypt_and_verify(ciphertext, tag)
+    except ValueError:
+        raise ValueError("Invalid password or corrupted auth_key")
+
+
+class EncryptedStorage(Storage):
     VERSION = 7
     USERNAME_TTL = 8 * 60 * 60
     FILE_EXTENSION = ".session"
@@ -130,9 +196,11 @@ class AIOSQLiteStorage(Storage):
     def __init__(
         self,
         client: Client,
+        password: str,
         use_wal: Optional[bool] = False,
     ):
         self.conn = None  # type: aiosqlite.Connection
+        self.password = password
 
         self.session_string = client.session_string
         self.in_memory = client.in_memory
@@ -209,34 +277,6 @@ class AIOSQLiteStorage(Storage):
             await self.create()
 
             if self.session_string:
-                # Old format
-                if len(self.session_string) in [
-                    self.SESSION_STRING_SIZE,
-                    self.SESSION_STRING_SIZE_64,
-                ]:
-                    dc_id, test_mode, auth_key, user_id, is_bot = struct.unpack(
-                        (
-                            self.OLD_SESSION_STRING_FORMAT
-                            if len(self.session_string) == self.SESSION_STRING_SIZE
-                            else self.OLD_SESSION_STRING_FORMAT_64
-                        ),
-                        base64.urlsafe_b64decode(
-                            self.session_string + "=" * (-len(self.session_string) % 4)
-                        ),
-                    )
-
-                    await self.dc_id(dc_id)
-                    await self.test_mode(test_mode)
-                    await self.auth_key(auth_key)
-                    await self.user_id(user_id)
-                    await self.is_bot(is_bot)
-                    await self.date(0)
-
-                    log.warning(
-                        "You are using an old session string format. Use export_session_string to update"
-                    )
-                    return
-
                 dc_id, api_id, test_mode, auth_key, user_id, is_bot = struct.unpack(
                     self.SESSION_STRING_FORMAT,
                     base64.urlsafe_b64decode(
@@ -281,15 +321,26 @@ class AIOSQLiteStorage(Storage):
         await self.conn.commit()
 
     async def save(self):
-        await self.date(int(time.time()))
+        await self.conn.execute(
+            "UPDATE sessions SET date = ?",
+            (int(time.time()),),
+        )
         await self.conn.commit()
 
     async def close(self):
+        await self.save()
         await self.conn.close()
+        self.conn = None
 
     async def delete(self):
-        if not self.in_memory:
-            Path(self.database).unlink()
+        if self.in_memory:
+            return
+
+        if self.conn is not None:
+            await self.close()
+
+        for suffix in ("", "-shm", "-wal"):
+            Path(str(self.database) + suffix).unlink(missing_ok=True)
 
     async def update_peers(self, peers: List[Tuple[int, int, str, str]]):
         await self.conn.executemany(
@@ -350,8 +401,6 @@ class AIOSQLiteStorage(Storage):
             "seq = COALESCE(excluded.seq, update_state.seq)",
             [(state.id, state.pts, state.qts, state.date, state.seq) for state in states],
         )
-
-        await self.save()
 
     async def delete_update_state(self, state_id):
         if isinstance(state_id, int):
@@ -448,7 +497,11 @@ class AIOSQLiteStorage(Storage):
         return await self._accessor("sessions", "test_mode", value)
 
     async def auth_key(self, value: bytes = object):
-        return await self._accessor("sessions", "auth_key", value)
+        if value is object:
+            r = await self._accessor("sessions", "auth_key", value)
+            return decrypt(r, self.password) if r else None
+        else:
+            return await self._accessor("sessions", "auth_key", encrypt(value, self.password))
 
     async def date(self, value: int = object):
         return await self._accessor("sessions", "date", value)

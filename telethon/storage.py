@@ -2,10 +2,10 @@ import sqlite3
 import logging
 import os
 import time
-from typing import Any, List, Tuple
+from typing import Any, Iterable, List, Optional, Tuple, Union
 
 from pyrogram import Client, raw, utils
-from pyrogram.storage import Storage
+from pyrogram.storage import Storage, UpdateState
 
 log = logging.getLogger(__name__)
 
@@ -83,8 +83,6 @@ class TelethonStorage(Storage):
     FILE_EXTENSION = ".session"
 
     def __init__(self, *, client: Client):
-        super().__init__(client.name)
-
         self._api_id = client.api_id
         self._test_mode = client.test_mode
         self._is_bot = client.bot_token is not None
@@ -204,24 +202,55 @@ class TelethonStorage(Storage):
             [(usernames[0], id) for id, usernames in usernames if usernames]
         )
 
-    async def update_state(self, value: Tuple[int, int, int, int, int] = object):
-        if value is object:
-            return self.conn.execute(
-                "SELECT id, pts, qts, date, seq FROM update_state "
-                "ORDER BY date ASC"
-            ).fetchall()
+    async def get_update_states(self, ids: Optional[Union[int, Iterable[int]]] = None):
+        query = "SELECT id, pts, qts, date, seq FROM update_state"
+
+        if ids is not None:
+            state_ids = (ids,) if isinstance(ids, int) else tuple(ids)
+
+            if not state_ids:
+                return []
+
+            placeholders = ", ".join("?" for _ in state_ids)
+            query += f" WHERE id IN ({placeholders})"
         else:
-            if isinstance(value, int):
-                self.conn.execute(
-                    "DELETE FROM update_state WHERE id = ?",
-                    (value,)
-                )
-            else:
-                self.conn.execute(
-                    "REPLACE INTO update_state (id, pts, qts, date, seq)"
-                    "VALUES (?, ?, ?, ?, ?)",
-                    value
-                )
+            state_ids = ()
+
+        rows = self.conn.execute(query + " ORDER BY date ASC", state_ids).fetchall()
+        return [UpdateState(*row) for row in rows]
+
+    async def set_update_state(self, update_state: Union[UpdateState, Iterable[UpdateState]]):
+        states = [update_state] if isinstance(update_state, UpdateState) else update_state
+
+        self.conn.executemany(
+            "INSERT INTO update_state (id, pts, qts, date, seq) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "pts = COALESCE(excluded.pts, update_state.pts), "
+            "qts = COALESCE(excluded.qts, update_state.qts), "
+            "date = COALESCE(excluded.date, update_state.date), "
+            "seq = COALESCE(excluded.seq, update_state.seq)",
+            [(state.id, state.pts, state.qts, state.date, state.seq) for state in states],
+        )
+
+    async def delete_update_state(self, state_id):
+        if isinstance(state_id, int):
+            self.conn.execute(
+                "DELETE FROM update_state WHERE id = ?",
+                (state_id,),
+            )
+            return
+
+        state_ids = tuple(state_id)
+
+        if not state_ids:
+            return
+
+        placeholders = ", ".join("?" for _ in state_ids)
+
+        self.conn.execute(
+            f"DELETE FROM update_state WHERE id IN ({placeholders})",
+            state_ids,
+        )
 
     async def get_peer_by_id(self, peer_id: int):
         r = self.conn.execute(

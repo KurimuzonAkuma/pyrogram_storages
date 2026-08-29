@@ -3,11 +3,11 @@ import logging
 import struct
 import time
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple, Union
 
 from cryptography.fernet import Fernet
 from pyrogram import Client, raw, utils
-from pyrogram.storage import Storage
+from pyrogram.storage import Storage, UpdateState
 
 import aiosqlite
 
@@ -112,21 +112,15 @@ PROD = {
 }
 
 def get_input_peer(peer_id: int, access_hash: int, peer_type: str):
-    if peer_type in ["user", "bot"]:
-        return raw.types.InputPeerUser(
-            user_id=peer_id,
-            access_hash=access_hash
-        )
+    if peer_type in {"user", "bot"}:
+        return raw.types.InputPeerUser(user_id=peer_id, access_hash=access_hash)
 
     if peer_type == "group":
-        return raw.types.InputPeerChat(
-            chat_id=-peer_id
-        )
+        return raw.types.InputPeerChat(chat_id=-peer_id)
 
-    if peer_type in ["direct", "channel", "forum", "supergroup"]:
+    if peer_type in {"direct", "channel", "forum", "supergroup", "community"}:
         return raw.types.InputPeerChannel(
-            channel_id=utils.get_channel_id(peer_id),
-            access_hash=access_hash
+            channel_id=utils.get_channel_id(peer_id), access_hash=access_hash
         )
 
     raise ValueError(f"Invalid peer type: {peer_type}")
@@ -143,8 +137,6 @@ class EncryptedFernetStorage(Storage):
         key: bytes,
         use_wal: Optional[bool] = False,
     ):
-        super().__init__(client.name)
-
         self.conn = None  # type: aiosqlite.Connection
         self.fernet = Fernet(key)
 
@@ -318,21 +310,58 @@ class EncryptedFernetStorage(Storage):
             [(id, username) for id, usernames in usernames for username in usernames],
         )
 
-    async def update_state(self, value: Tuple[int, int, int, int, int] = object):
-        if value is object:
-            r = await self.conn.execute(
-                "SELECT id, pts, qts, date, seq FROM update_state ORDER BY date ASC"
-            )
+    async def get_update_states(self, ids: Optional[Union[int, Iterable[int]]] = None):
+        query = "SELECT id, pts, qts, date, seq FROM update_state"
 
-            return await r.fetchall()
+        if ids is not None:
+            state_ids = (ids,) if isinstance(ids, int) else tuple(ids)
+
+            if not state_ids:
+                return []
+
+            placeholders = ", ".join("?" for _ in state_ids)
+            query += f" WHERE id IN ({placeholders})"
         else:
-            if isinstance(value, int):
-                await self.conn.execute("DELETE FROM update_state WHERE id = ?", (value,))
-            else:
-                await self.conn.execute(
-                    "REPLACE INTO update_state (id, pts, qts, date, seq) VALUES (?, ?, ?, ?, ?)",
-                    value,
-                )
+            state_ids = ()
+
+        r = await self.conn.execute(query + " ORDER BY date ASC", state_ids)
+        rows = await r.fetchall()
+        return [UpdateState(*row) for row in rows]
+
+    async def set_update_state(self, update_state: Union[UpdateState, Iterable[UpdateState]]):
+        states = [update_state] if isinstance(update_state, UpdateState) else update_state
+
+        await self.conn.executemany(
+            "INSERT INTO update_state (id, pts, qts, date, seq) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "pts = COALESCE(excluded.pts, update_state.pts), "
+            "qts = COALESCE(excluded.qts, update_state.qts), "
+            "date = COALESCE(excluded.date, update_state.date), "
+            "seq = COALESCE(excluded.seq, update_state.seq)",
+            [(state.id, state.pts, state.qts, state.date, state.seq) for state in states],
+        )
+
+        await self.save()
+
+    async def delete_update_state(self, state_id):
+        if isinstance(state_id, int):
+            await self.conn.execute(
+                "DELETE FROM update_state WHERE id = ?",
+                (state_id,),
+            )
+            return
+
+        state_ids = tuple(state_id)
+
+        if not state_ids:
+            return
+
+        placeholders = ", ".join("?" for _ in state_ids)
+
+        await self.conn.execute(
+            f"DELETE FROM update_state WHERE id IN ({placeholders})",
+            state_ids,
+        )
 
     async def get_peer_by_id(self, peer_id: int):
         r = await (await self.conn.execute(

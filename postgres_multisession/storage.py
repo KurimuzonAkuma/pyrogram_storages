@@ -1,15 +1,25 @@
 import time
-from typing import Tuple, List, Any
+from typing import Any, Iterable, List, Optional, Tuple, Union
 
 from pyrogram import Client, raw, utils
 from pyrogram.storage import Storage
 from sqlalchemy import (
-    Column, Integer, String, BigInteger, Boolean, ForeignKey, delete, LargeBinary, event
+    BigInteger,
+    Boolean,
+    Column,
+    ForeignKey,
+    Integer,
+    LargeBinary,
+    String,
+    delete,
+    event,
+    select,
 )
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.future import select
-from sqlalchemy.orm import sessionmaker, relationship, aliased
+from sqlalchemy.orm import aliased, relationship, sessionmaker
 
 Base = declarative_base()
 
@@ -74,21 +84,15 @@ class VersionModel(Base):
 
 
 def get_input_peer(peer_id: int, access_hash: int, peer_type: str):
-    if peer_type in ["user", "bot"]:
-        return raw.types.InputPeerUser(
-            user_id=peer_id,
-            access_hash=access_hash
-        )
+    if peer_type in {"user", "bot"}:
+        return raw.types.InputPeerUser(user_id=peer_id, access_hash=access_hash)
 
     if peer_type == "group":
-        return raw.types.InputPeerChat(
-            chat_id=-peer_id
-        )
+        return raw.types.InputPeerChat(chat_id=-peer_id)
 
-    if peer_type in ["channel", "supergroup"]:
+    if peer_type in {"direct", "channel", "forum", "supergroup", "community"}:
         return raw.types.InputPeerChannel(
-            channel_id=utils.get_channel_id(peer_id),
-            access_hash=access_hash
+            channel_id=utils.get_channel_id(peer_id), access_hash=access_hash
         )
 
     raise ValueError(f"Invalid peer type: {peer_type}")
@@ -99,7 +103,6 @@ class MultiPostgresStorage(Storage):
     USERNAME_TTL = 8 * 60 * 60
 
     def __init__(self, client: Client, database: dict):
-        super().__init__(client.name)
         db_url = f"postgresql+asyncpg://{database['db_user']}:{database['db_pass']}@{database['db_host']}:{database['db_port']}/{database['db_name']}"
         self.engine = create_async_engine(db_url, echo=False)
         self.session_maker = sessionmaker(
@@ -254,42 +257,111 @@ class MultiPostgresStorage(Storage):
             peer_id, access_hash, peer_type, last_update_on = r
             return get_input_peer(peer_id, access_hash, peer_type)
 
-    async def update_state(self, value: Tuple[int, int, int, int, int] = object):
+    async def get_update_states(
+        self,
+        ids: Optional[Union[int, Iterable[int]]] = None
+    ):
         async with self.session_maker() as session:
-            if value == object:
-                result = await session.execute(
-                    select(UpdateStateModel).filter_by(session_name=self.name)
+            query = select(
+                UpdateStateModel.id,
+                UpdateStateModel.pts,
+                UpdateStateModel.qts,
+                UpdateStateModel.date,
+                UpdateStateModel.seq,
+            ).where(
+                UpdateStateModel.session_name == self.name
+            )
+
+            if ids is not None:
+                state_ids = (ids,) if isinstance(ids, int) else tuple(ids)
+
+                if not state_ids:
+                    return []
+
+                query = query.where(
+                    UpdateStateModel.id.in_(state_ids)
                 )
-                return result.scalars().all()
+
+            query = query.order_by(UpdateStateModel.date.asc())
+
+            result = await session.execute(query)
+            rows = result.all()
+
+            return [
+                UpdateState(
+                    id=row.id,
+                    pts=row.pts,
+                    qts=row.qts,
+                    date=row.date,
+                    seq=row.seq,
+                )
+                for row in rows
+            ]
+
+    async def set_update_state(
+        self,
+        update_state: Union[UpdateState, Iterable[UpdateState]]
+    ):
+        states = (
+            [update_state]
+            if isinstance(update_state, UpdateState)
+            else list(update_state)
+        )
+
+        if not states:
+            return
+
+        async with self.session_maker() as session:
+            values = [
+                {
+                    "id": state.id,
+                    "session_name": self.name,
+                    "pts": state.pts,
+                    "qts": state.qts,
+                    "date": state.date,
+                    "seq": state.seq,
+                }
+                for state in states
+            ]
+
+            stmt = insert(UpdateStateModel).values(values)
+
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[
+                    UpdateStateModel.id
+                ],
+                set_={
+                    "pts": stmt.excluded.pts,
+                    "qts": stmt.excluded.qts,
+                    "date": stmt.excluded.date,
+                    "seq": stmt.excluded.seq,
+                },
+            )
+
+            await session.execute(stmt)
+            await session.commit()
+
+    async def delete_update_state(
+        self,
+        state_id: Union[int, Iterable[int]]
+    ):
+        async with self.session_maker() as session:
+            if isinstance(state_id, int):
+                state_ids = (state_id,)
             else:
-                if isinstance(value, int):
-                    await session.execute(
-                        delete(UpdateStateModel)
-                        .where(UpdateStateModel.session_name == self.name, UpdateStateModel.id == value)
-                    )
-                else:
-                    state = await session.execute(
-                        select(UpdateStateModel).filter_by(session_name=self.name, id=value[0])
-                    )
-                    state_instance = state.scalar_one_or_none()
+                state_ids = tuple(state_id)
 
-                    if state_instance:
-                        state_instance.pts = value[1]
-                        state_instance.qts = value[2]
-                        state_instance.date = value[3]
-                        state_instance.seq = value[4]
-                    else:
-                        state_instance = UpdateStateModel(
-                            id=value[0],
-                            session_name=self.name,
-                            pts=value[1],
-                            qts=value[2],
-                            date=value[3],
-                            seq=value[4]
-                        )
-                        session.add(state_instance)
+            if not state_ids:
+                return
 
-                await session.commit()
+            await session.execute(
+                delete(UpdateStateModel).where(
+                    UpdateStateModel.session_name == self.name,
+                    UpdateStateModel.id.in_(state_ids),
+                )
+            )
+
+            await session.commit()
 
     async def get_peer_by_phone_number(self, phone_number: str):
         async with self.session_maker() as session:
