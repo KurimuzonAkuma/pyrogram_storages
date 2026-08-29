@@ -43,7 +43,6 @@ CREATE TABLE peers
 (
     id             INTEGER PRIMARY KEY,
     access_hash    INTEGER,
-    type           INTEGER NOT NULL,
     phone_number   TEXT,
     last_update_on INTEGER NOT NULL DEFAULT (CAST(STRFTIME('%s', 'now') AS INTEGER))
 );
@@ -118,19 +117,21 @@ PROD = {
 }
 
 
-def get_input_peer(peer_id: int, access_hash: int, peer_type: str):
-    if peer_type in {"user", "bot"}:
+def get_input_peer(peer_id: int, access_hash: int):
+    peer_type = utils.get_peer_type(peer_id)
+
+    if peer_type == "user":
         return raw.types.InputPeerUser(user_id=peer_id, access_hash=access_hash)
 
-    if peer_type == "group":
+    if peer_type == "chat":
         return raw.types.InputPeerChat(chat_id=-peer_id)
 
-    if peer_type in {"direct", "channel", "forum", "supergroup", "community"}:
+    if peer_type in {"channel", "monoforum"}:
         return raw.types.InputPeerChannel(
             channel_id=utils.get_channel_id(peer_id), access_hash=access_hash
         )
 
-    raise ValueError(f"Invalid peer type: {peer_type}")
+    raise ValueError(f"Peer id invalid: {peer_id}")
 
 
 def _derive_key(password: str, salt: bytes) -> bytes:
@@ -189,7 +190,7 @@ def decrypt(data: bytes, password: str) -> bytes:
 
 
 class EncryptedStorage(Storage):
-    VERSION = 7
+    VERSION = 8
     USERNAME_TTL = 8 * 60 * 60
     FILE_EXTENSION = ".session"
 
@@ -219,27 +220,27 @@ class EncryptedStorage(Storage):
 
             version += 1
 
-        if version == 2:
+        elif version == 2:
             await self.conn.execute("ALTER TABLE sessions ADD api_id INTEGER;")
 
             version += 1
 
-        if version == 3:
+        elif version == 3:
             await self.conn.executescript(USERNAMES_SCHEMA)
 
             version += 1
 
-        if version == 4:
+        elif version == 4:
             await self.conn.executescript(UPDATE_STATE_SCHEMA)
 
             version += 1
 
-        if version == 5:
+        elif version == 5:
             await self.conn.execute("CREATE INDEX idx_usernames_id ON usernames (id);")
 
             version += 1
 
-        if version == 6:
+        elif version == 6:
             if await self.test_mode():
                 address = TEST[await self.dc_id()]
                 port = 80
@@ -255,9 +256,14 @@ class EncryptedStorage(Storage):
 
             version += 1
 
+        elif version == 7:
+            await self.conn.execute("ALTER TABLE peers DROP COLUMN type;")
+
+            version += 1
+
         await self.version(version)
 
-        await self.conn.commit()
+        await self.save()
 
     async def create(self):
         await self.conn.executescript(SCHEMA)
@@ -269,7 +275,7 @@ class EncryptedStorage(Storage):
             (2, "149.154.167.51", 443, None, None, None, 0, None, None),
         )
 
-        await self.conn.commit()
+        await self.save()
 
     async def open(self):
         if self.in_memory:
@@ -284,8 +290,6 @@ class EncryptedStorage(Storage):
                     ),
                 )
 
-                await self.dc_id(dc_id)
-
                 if test_mode:
                     await self.server_address(TEST[dc_id])
                     await self.port(80)
@@ -293,6 +297,7 @@ class EncryptedStorage(Storage):
                     await self.server_address(PROD[dc_id])
                     await self.port(443)
 
+                await self.dc_id(dc_id)
                 await self.api_id(api_id)
                 await self.test_mode(test_mode)
                 await self.auth_key(auth_key)
@@ -309,16 +314,17 @@ class EncryptedStorage(Storage):
 
         if self.use_wal:
             await self.conn.execute("PRAGMA journal_mode=WAL")
+            await self.conn.execute("PRAGMA synchronous=NORMAL")
         else:
             await self.conn.execute("PRAGMA journal_mode=DELETE")
+
+        await self.conn.execute("PRAGMA temp_store=MEMORY")
+        await self.conn.execute("PRAGMA cache_size=-8000")
 
         if file_exists:
             await self.update()
         else:
             await self.create()
-
-        await self.conn.execute("VACUUM")
-        await self.conn.commit()
 
     async def save(self):
         await self.conn.execute(
@@ -328,6 +334,7 @@ class EncryptedStorage(Storage):
         await self.conn.commit()
 
     async def close(self):
+        await self.conn.execute("VACUUM")
         await self.save()
         await self.conn.close()
         self.conn = None
@@ -343,8 +350,10 @@ class EncryptedStorage(Storage):
             Path(str(self.database) + suffix).unlink(missing_ok=True)
 
     async def update_peers(self, peers: List[Tuple[int, int, str, str]]):
+        peers = [(peer_id, access_hash, phone) for peer_id, access_hash, _, phone in peers]
+
         await self.conn.executemany(
-            "REPLACE INTO peers (id, access_hash, type, phone_number) VALUES (?, ?, ?, ?)", peers
+            "REPLACE INTO peers (id, access_hash, phone_number) VALUES (?, ?, ?)", peers
         )
 
     async def update_usernames(self, usernames: Iterable[Tuple[int, List[Optional[str]]]]):
@@ -424,9 +433,7 @@ class EncryptedStorage(Storage):
 
     async def get_peer_by_id(self, peer_id: int):
         r = await (
-            await self.conn.execute(
-                "SELECT id, access_hash, type FROM peers WHERE id = ?", (peer_id,)
-            )
+            await self.conn.execute("SELECT id, access_hash FROM peers WHERE id = ?", (peer_id,))
         ).fetchone()
 
         if r is None:
@@ -437,10 +444,11 @@ class EncryptedStorage(Storage):
     async def get_peer_by_username(self, username: str):
         r = await (
             await self.conn.execute(
-                "SELECT p.id, p.access_hash, p.type, p.last_update_on FROM peers p "
+                "SELECT p.id, p.access_hash, p.last_update_on FROM peers p "
                 "JOIN usernames u ON p.id = u.id "
                 "WHERE u.username = ? "
-                "ORDER BY p.last_update_on DESC",
+                "ORDER BY p.last_update_on DESC "
+                "LIMIT 1",
                 (username,),
             )
         ).fetchone()
@@ -448,15 +456,15 @@ class EncryptedStorage(Storage):
         if r is None:
             raise KeyError(f"Username not found: {username}")
 
-        if abs(time.time() - r[3]) > self.USERNAME_TTL:
+        if abs(time.time() - r[2]) > self.USERNAME_TTL:
             raise KeyError(f"Username expired: {username}")
 
-        return get_input_peer(*r[:3])
+        return get_input_peer(*r[:2])
 
     async def get_peer_by_phone_number(self, phone_number: str):
         r = await (
             await self.conn.execute(
-                "SELECT id, access_hash, type FROM peers WHERE phone_number = ?", (phone_number,)
+                "SELECT id, access_hash FROM peers WHERE phone_number = ?", (phone_number,)
             )
         ).fetchone()
 
@@ -472,7 +480,7 @@ class EncryptedStorage(Storage):
 
     async def _set(self, table: str, attr: str, value: Any):
         await self.conn.execute(f"UPDATE {table} SET {attr} = ?", (value,))
-        await self.conn.commit()
+        await self.save()
 
     async def _accessor(self, table: str, attr: str, value: Any = object):
         return (
